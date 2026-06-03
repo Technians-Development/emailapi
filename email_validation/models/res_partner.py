@@ -2,32 +2,22 @@ import re
 import smtplib
 import dns.resolver
 import socket
+import random
+import string
+from odoo.modules.module import get_module_path
+import os
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from odoo import models, fields, api
 
-# ---------------------------------------------------------
-# EMAIL REGEX
-# ---------------------------------------------------------
-
 EMAIL_REGEX = re.compile(
     r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
 )
 
-# ---------------------------------------------------------
-# MX CACHE
-# ---------------------------------------------------------
-
 MX_CACHE = {}
 
-# ---------------------------------------------------------
-# SMTP ERROR CODES
-# ---------------------------------------------------------
-
 ERROR_CODES = {
-
-    # SUCCESS
     250: "VALID_EMAIL",
     251: "FORWARDED_EMAIL",
 
@@ -45,13 +35,11 @@ ERROR_CODES = {
     554: "TRANSACTION_FAILED",
 }
 
+DISPOSABLE_DOMAINS = None
+
 
 class ResPartner(models.Model):
     _inherit = 'res.partner'
-
-    # ---------------------------------------------------------
-    # FIELDS
-    # ---------------------------------------------------------
 
     email_valid = fields.Boolean(
         string='Email Valid',
@@ -73,9 +61,17 @@ class ResPartner(models.Model):
         ('error', 'Error')
     ], default='pending')
 
-    # ---------------------------------------------------------
-    # CREATE
-    # ---------------------------------------------------------
+    catch_all = fields.Boolean("Is Catchall Mail")
+
+    first_name = fields.Char('First Name')
+    last_name = fields.Char('Last Name')
+    linked_in = fields.Char('LinkedIn')
+    source = fields.Char('Source')
+
+    @api.onchange('first_name', 'last_name')
+    def _onchange_first_name_last_name(self):
+        for rec in self:
+            rec.name = ' '.join(filter(None, [rec.first_name, rec.last_name]))
 
     @api.model_create_multi
     def create(self, vals_list):
@@ -89,10 +85,6 @@ class ResPartner(models.Model):
 
         return super().create(vals_list)
 
-    # ---------------------------------------------------------
-    # WRITE
-    # ---------------------------------------------------------
-
     def write(self, vals):
 
         if 'email' in vals:
@@ -102,20 +94,19 @@ class ResPartner(models.Model):
 
         return super().write(vals)
 
-    # ---------------------------------------------------------
-    # GET MX HOST
-    # ---------------------------------------------------------
-
     def _get_mx_host(self, domain):
 
         domain = domain.strip().lower()
-
-        # CACHE
 
         if domain in MX_CACHE:
             return MX_CACHE[domain]
 
         resolver = dns.resolver.Resolver()
+
+        # resolver.nameservers = [
+        #     '8.8.8.8',  # Google
+        #     '8.8.4.4'
+        # ]
 
         resolver.timeout = 5
         resolver.lifetime = 5
@@ -134,30 +125,14 @@ class ResPartner(models.Model):
             return False
 
         mx_host = mx_records[0][1]
-
-        # SAVE CACHE
-
         MX_CACHE[domain] = mx_host
 
         return mx_host
 
-    # ---------------------------------------------------------
-    # SMTP VALIDATION
-    # ---------------------------------------------------------
-
     def smtp_check(self, email):
 
         try:
-
-            # -------------------------------------------------
-            # CLEAN EMAIL
-            # -------------------------------------------------
-
             email = (email or '').strip().lower()
-
-            # -------------------------------------------------
-            # FORMAT VALIDATION
-            # -------------------------------------------------
 
             if not EMAIL_REGEX.match(email):
                 return {
@@ -168,15 +143,25 @@ class ResPartner(models.Model):
                     "message": "Invalid email format"
                 }
 
-            # -------------------------------------------------
-            # DOMAIN
-            # -------------------------------------------------
-
             domain = email.split('@')[1]
 
-            # -------------------------------------------------
-            # MX LOOKUP
-            # -------------------------------------------------
+            try:
+                if self._check_disposable_domain(domain):
+                    self._store_domain(
+                        domain,
+                        disposable=True
+                    )
+
+                    return {
+                        "success": False,
+                        "state": "invalid",
+                        "error_code": "DISPOSABLE_DOMAIN",
+                        "smtp_code": None,
+                        "message": "Disposable email domain detected"
+                    }
+
+            except Exception as e:
+                pass
 
             try:
 
@@ -211,10 +196,6 @@ class ResPartner(models.Model):
                     "message": str(e)
                 }
 
-            # -------------------------------------------------
-            # SMTP CONNECTION
-            # -------------------------------------------------
-
             server = None
 
             try:
@@ -222,8 +203,6 @@ class ResPartner(models.Model):
                 server = smtplib.SMTP(timeout=45)
 
                 server.connect(mx_host, 25)
-
-                # EHLO
 
                 ehlo_code, ehlo_message = server.ehlo(
                     "technians.com"
@@ -238,11 +217,7 @@ class ResPartner(models.Model):
                         "message": str(ehlo_message)
                     }
 
-                # MAIL FROM
-
-                mail_code, mail_message = server.mail(
-                    "career@technians.com"
-                )
+                mail_code, mail_message = server.mail("career@technians.com")
 
                 if mail_code != 250:
                     return {
@@ -253,9 +228,19 @@ class ResPartner(models.Model):
                         "message": str(mail_message)
                     }
 
-                # RCPT TO
-
                 code, message = server.rcpt(email)
+
+                fake_email = self._generate_random_email(domain)
+
+                try:
+                    fake_code, fake_message = server.rcpt(fake_email)
+                except Exception:
+                    fake_code = None
+
+                catch_all = False
+
+                if code in [250, 251] and fake_code in [250, 251]:
+                    catch_all = True
 
             finally:
 
@@ -267,10 +252,6 @@ class ResPartner(models.Model):
                     except Exception:
                         pass
 
-            # -------------------------------------------------
-            # DECODE MESSAGE
-            # -------------------------------------------------
-
             message = (
                 message.decode()
                 if isinstance(message, bytes)
@@ -281,14 +262,9 @@ class ResPartner(models.Model):
                 code,
                 "UNKNOWN_SMTP_RESPONSE"
             )
+            valid_codes = {250, 251}
 
-            # -------------------------------------------------
-            # VALID / INVALID / ERROR
-            # -------------------------------------------------
-
-            valid_codes = [250, 251]
-
-            invalid_codes = [550, 551, 553]
+            invalid_codes = {550, 551, 553}
 
             if code in valid_codes:
 
@@ -305,6 +281,13 @@ class ResPartner(models.Model):
                 success = False
                 state = 'error'
 
+            # store domain info
+            try:
+                if catch_all:
+                    self._store_domain(domain, catch_all=True)
+            except Exception:
+                pass
+
             return {
 
                 "success": success,
@@ -315,12 +298,10 @@ class ResPartner(models.Model):
 
                 "smtp_code": code,
 
-                "message": message
+                "message": message,
+                "catch_all": catch_all
             }
 
-        # -----------------------------------------------------
-        # SOCKET TIMEOUT
-        # -----------------------------------------------------
 
         except socket.timeout:
 
@@ -336,10 +317,6 @@ class ResPartner(models.Model):
 
                 "message": "SMTP connection timeout"
             }
-
-        # -----------------------------------------------------
-        # OS ERRORS
-        # -----------------------------------------------------
 
         except OSError as e:
 
@@ -378,10 +355,6 @@ class ResPartner(models.Model):
                 "message": str(e)
             }
 
-        # -----------------------------------------------------
-        # UNKNOWN ERROR
-        # -----------------------------------------------------
-
         except Exception as e:
 
             return {
@@ -396,10 +369,6 @@ class ResPartner(models.Model):
 
                 "message": str(e)
             }
-
-    # ---------------------------------------------------------
-    # SINGLE BUTTON VALIDATION
-    # ---------------------------------------------------------
 
     def action_validate_email(self):
 
@@ -428,12 +397,9 @@ class ResPartner(models.Model):
                 'validation_msg': (
                     f"{result['error_code']} | "
                     f"{result['message']}"
-                )
+                ),
+                'catch_all': result.get('catch_all', False),
             })
-
-    # ---------------------------------------------------------
-    # THREAD VALIDATION
-    # ---------------------------------------------------------
 
     def _validate_partner_email_thread(self, email, partner_id):
 
@@ -448,11 +414,12 @@ class ResPartner(models.Model):
                 'success': result['success'],
 
                 'message': (
-                    f"{result['error_code']} | "
                     f"{result['message']}"
                 ),
+                'error_code': result['error_code'],
 
-                'state': result['state']
+                'state': result['state'],
+                'catch_all': result.get('catch_all', False)
             }
 
         except Exception as e:
@@ -464,13 +431,11 @@ class ResPartner(models.Model):
                 'success': False,
 
                 'message': str(e),
+                'error_code': 'UNKNOWN_ERROR',
 
-                'state': 'error'
+                'state': 'error',
+                'catch_all': False,
             }
-
-    # ---------------------------------------------------------
-    # CRON VALIDATION
-    # ---------------------------------------------------------
 
     @api.model
     def cron_validate_partner_emails(self):
@@ -512,10 +477,6 @@ class ResPartner(models.Model):
         if not partners:
             return
 
-        # -------------------------------------------------
-        # MULTI THREADING
-        # -------------------------------------------------
-
         with ThreadPoolExecutor(max_workers=5) as executor:
 
             futures = {
@@ -528,10 +489,6 @@ class ResPartner(models.Model):
 
                 for partner in partners
             }
-
-            # -------------------------------------------------
-            # LIVE UPDATE
-            # -------------------------------------------------
 
             for future in as_completed(futures):
 
@@ -551,15 +508,64 @@ class ResPartner(models.Model):
                     partner.sudo().write({
 
                         'email_valid': result['success'],
+                        'validation_state': result['state'],
+                        'validation_msg': f"{result['error_code']} | "
+                                          f"{result['message']}",
 
-                        'validation_msg': result['message'],
-
-                        'validation_state': result['state']
                     })
-
-                    # LIVE COMMIT
 
                     self.env.cr.commit()
 
                 except Exception:
                     pass
+
+    def _generate_random_email(self, domain):
+        rand = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+        return f"{rand}@{domain}"
+
+    def _store_domain(self, domain, catch_all=False, disposable=False):
+        Domain = self.env['web.domain'].sudo()
+
+        existing = Domain.search([('name', '=', domain)], limit=1)
+
+        if existing:
+            vals = {}
+            if catch_all and not existing.is_catchall:
+                vals['is_catchall'] = True
+            if disposable and not existing.is_disposable:
+                vals['is_disposable'] = True
+
+            if vals:
+                existing.write(vals)
+        else:
+            Domain.create({
+                'name': domain,
+                'is_catchall': catch_all,
+                'is_disposable': disposable
+            })
+
+    def _load_disposable_domains(self):
+        global DISPOSABLE_DOMAINS
+
+        if DISPOSABLE_DOMAINS is None:
+            module_path = get_module_path('email_validation')
+
+            file_path = os.path.join(
+                module_path,
+                'data',
+                'disposable_email_blocklist.conf'
+            )
+
+            with open(file_path, 'r', encoding='utf-8') as f:
+                DISPOSABLE_DOMAINS = {
+                    line.strip().lower()
+                    for line in f
+                    if line.strip()
+                       and not line.startswith('#')
+                }
+
+        return DISPOSABLE_DOMAINS
+
+    def _check_disposable_domain(self, domain):
+        domains = self._load_disposable_domains()
+        return domain.lower() in domains
