@@ -68,6 +68,43 @@ class ResPartner(models.Model):
     linked_in = fields.Char('LinkedIn')
     source = fields.Char('Source')
 
+    def load(self, fields, data):
+        filename = self.env.context.get('import_filename')
+
+        if filename and 'source' not in fields:
+            fields = list(fields)
+
+            source = os.path.splitext(filename)[0]
+
+            fields.append('source')
+
+            data = [
+                row + [source]
+                for row in data
+            ]
+        if 'name' not in fields or all(not row[fields.index('name')] for row in data):
+            first_idx = fields.index('first_name') if 'first_name' in fields else None
+            last_idx = fields.index('last_name') if 'last_name' in fields else None
+
+            if first_idx is not None or last_idx is not None:
+                fields.append('name')
+
+                new_data = []
+                for row in data:
+                    first = row[first_idx] if first_idx is not None else ''
+                    last = row[last_idx] if last_idx is not None else ''
+
+                    full_name = ' '.join(
+                        filter(None, [first, last])
+                    ).strip()
+
+                    row = row + [full_name]
+                    new_data.append(row)
+
+                data = new_data
+
+        return super().load(fields, data)
+
     @api.onchange('first_name', 'last_name')
     def _onchange_first_name_last_name(self):
         for rec in self:
@@ -83,6 +120,14 @@ class ResPartner(models.Model):
                 vals['validation_msg'] = False
                 vals['validation_state'] = 'pending'
 
+            if not vals.get('name'):
+                vals['name'] = ' '.join(
+                    filter(None, [
+                        vals.get('first_name'),
+                        vals.get('last_name')
+                    ])
+                )
+
         return super().create(vals_list)
 
     def write(self, vals):
@@ -91,6 +136,14 @@ class ResPartner(models.Model):
             vals['email_valid'] = False
             vals['validation_msg'] = False
             vals['validation_state'] = 'pending'
+
+        if not vals.get('name'):
+            vals['name'] = ' '.join(
+                filter(None, [
+                    vals.get('first_name'),
+                    vals.get('last_name')
+                ])
+            )
 
         return super().write(vals)
 
@@ -511,6 +564,7 @@ class ResPartner(models.Model):
                         'validation_state': result['state'],
                         'validation_msg': f"{result['error_code']} | "
                                           f"{result['message']}",
+                        'catch_all': result.get('catch_all', False),
 
                     })
 
