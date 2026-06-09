@@ -61,6 +61,8 @@ class ResPartner(models.Model):
         ('error', 'Error')
     ], default='pending')
 
+    validation_code = fields.Char('')
+
     catch_all = fields.Boolean("Is Catchall Mail")
 
     first_name = fields.Char('First Name')
@@ -132,18 +134,14 @@ class ResPartner(models.Model):
 
     def write(self, vals):
 
-        if 'email' in vals:
-            vals['email_valid'] = False
-            vals['validation_msg'] = False
-            vals['validation_state'] = 'pending'
+        for rec in self:
+            first_name = vals.get('first_name', rec.first_name)
+            last_name = vals.get('last_name', rec.last_name)
 
-        if not vals.get('name'):
-            vals['name'] = ' '.join(
-                filter(None, [
-                    vals.get('first_name'),
-                    vals.get('last_name')
-                ])
-            )
+            if 'first_name' in vals or 'last_name' in vals:
+                vals['name'] = ' '.join(
+                    filter(None, [first_name, last_name])
+                )
 
         return super().write(vals)
 
@@ -311,15 +309,68 @@ class ResPartner(models.Model):
                 else str(message)
             )
 
+            # error_code = ERROR_CODES.get(
+            #     code,
+            #     "UNKNOWN_SMTP_RESPONSE"
+            # )
+            # valid_codes = {250, 251}
+            #
+            # invalid_codes = {550, 551, 553}
+            #
+            # if code in valid_codes:
+            #
+            #     success = True
+            #     state = 'valid'
+            #
+            # elif code in invalid_codes:
+            #
+            #     success = False
+            #     state = 'invalid'
+            #
+            # else:
+            #
+            #     success = False
+            #     state = 'error'
+            #
+            # # store domain info
+            # try:
+            #     if catch_all:
+            #         self._store_domain(domain, catch_all=True)
+            # except Exception:
+            #     pass
+            #
+            # return {
+            #
+            #     "success": success,
+            #
+            #     "state": state,
+            #
+            #     "error_code": error_code,
+            #
+            #     "smtp_code": code,
+            #
+            #     "message": message,
+            #     "catch_all": catch_all
+            # }
             error_code = ERROR_CODES.get(
                 code,
                 "UNKNOWN_SMTP_RESPONSE"
             )
-            valid_codes = {250, 251}
 
+            valid_codes = {250, 251}
             invalid_codes = {550, 551, 553}
 
-            if code in valid_codes:
+            if catch_all:
+
+                success = False
+                state = 'error'
+                error_code = 'CATCH_ALL_DOMAIN'
+                message = (
+                    'Domain accepts all recipient addresses. '
+                    'Mailbox existence cannot be verified.'
+                )
+
+            elif code in valid_codes:
 
                 success = True
                 state = 'valid'
@@ -451,6 +502,7 @@ class ResPartner(models.Model):
                     f"{result['error_code']} | "
                     f"{result['message']}"
                 ),
+                'validation_code': result['smtp_code'],
                 'catch_all': result.get('catch_all', False),
             })
 
@@ -470,6 +522,7 @@ class ResPartner(models.Model):
                     f"{result['message']}"
                 ),
                 'error_code': result['error_code'],
+                'validation_code': result['smtp_code'],
 
                 'state': result['state'],
                 'catch_all': result.get('catch_all', False)
@@ -485,6 +538,7 @@ class ResPartner(models.Model):
 
                 'message': str(e),
                 'error_code': 'UNKNOWN_ERROR',
+                'validation_code': result['smtp_code'],
 
                 'state': 'error',
                 'catch_all': False,
@@ -564,6 +618,8 @@ class ResPartner(models.Model):
                         'validation_state': result['state'],
                         'validation_msg': f"{result['error_code']} | "
                                           f"{result['message']}",
+                        'validation_code': result['smtp_code'],
+
                         'catch_all': result.get('catch_all', False),
 
                     })

@@ -52,6 +52,7 @@
                     <group>
                         <field name="batch"/>
                         <field name="catch_all"/>
+                        <field name="validation_code"/>
                     </group>
                 </group>
             </xpath>
